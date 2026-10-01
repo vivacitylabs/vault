@@ -153,6 +153,45 @@ func TestConsumptionBillingMetricsWorker(t *testing.T) {
 	verifyExpectedRoleCounts(t, counts, 5)
 }
 
+// Disabling the periodic collector must preserve billing state and secret access.
+func TestConsumptionBillingMetricsWorkerDisabled(t *testing.T) {
+	t.Setenv("VAULT_DISABLE_CONSUMPTION_BILLING", "true")
+	core, _, root := TestCoreUnsealedWithConfig(t, &CoreConfig{
+		BillingConfig: billing.BillingConfig{
+			MetricsUpdateCadence: 10 * time.Millisecond,
+		},
+	})
+	ctx := namespace.RootContext(context.Background())
+
+	require.NotNil(t, core.consumptionBilling)
+	require.NotNil(t, core.consumptionBilling.DataProtectionCallCounts.Transit)
+	require.NotNil(t, core.consumptionBilling.IdentityTokenUnits.OidcTokenDuration)
+	view, ok := core.GetBillingSubView()
+	require.True(t, ok)
+	require.NotNil(t, view)
+
+	write := logical.TestRequest(t, logical.UpdateOperation, "secret/billing-disabled")
+	write.ClientToken = root
+	write.Data = map[string]interface{}{"value": "test"}
+	resp, err := core.HandleRequest(ctx, write)
+	require.NoError(t, err)
+	require.False(t, resp.IsError())
+
+	read := logical.TestRequest(t, logical.ReadOperation, write.Path)
+	read.ClientToken = root
+	resp, err = core.HandleRequest(ctx, read)
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, "test", resp.Data["value"])
+
+	// Allow many collection intervals to pass: the worker must not persist metrics.
+	require.Never(t, func() bool {
+		keys, err := view.List(ctx, billing.GetMonthlyBillingPath(billing.ReplicatedPrefix, time.Now().UTC()))
+		require.NoError(t, err)
+		return len(keys) > 0
+	}, 250*time.Millisecond, 10*time.Millisecond)
+}
+
 // TestHandleEndOfMonthMetrics tests that HandleEndOfMonth cleans up
 // billing metrics from billing.DefaultBillingRetentionMonths ago (keeping billing.DefaultBillingRetentionMonths of data) and resets the in memory billing metrics
 func TestHandleEndOfMonthMetrics(t *testing.T) {
