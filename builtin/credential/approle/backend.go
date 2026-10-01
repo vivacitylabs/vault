@@ -5,7 +5,10 @@ package approle
 
 import (
 	"context"
+	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/hashicorp/vault/sdk/framework"
 	"github.com/hashicorp/vault/sdk/helper/consts"
@@ -38,6 +41,14 @@ type backend struct {
 
 	// Guard to clean-up the expired SecretID entries
 	tidySecretIDCASGuard *uint32
+
+	// Minimum time between periodic SecretID tidy runs, set from
+	// VAULT_APPROLE_TIDY_INTERVAL. Zero keeps the upstream behaviour of
+	// attempting a tidy on every periodic invocation.
+	periodicTidyInterval time.Duration
+
+	// Unix nanoseconds of the last periodic tidy attempt
+	lastPeriodicTidy atomic.Int64
 
 	// Locks to make changes to role entries. These will be initialized to a
 	// predefined number of locks when the backend is created, and will be
@@ -73,7 +84,25 @@ func Factory(ctx context.Context, conf *logical.BackendConfig) (logical.Backend,
 	if err := b.Setup(ctx, conf); err != nil {
 		return nil, err
 	}
+	b.configurePeriodicTidyInterval(os.Getenv("VAULT_APPROLE_TIDY_INTERVAL"))
 	return b, nil
+}
+
+// configurePeriodicTidyInterval sets the minimum time between periodic tidy
+// runs. Each run lists every role's SecretIDs, which is costly on object
+// storage with many roles. An invalid value is ignored rather than failing
+// the mount, so logins keep working.
+func (b *backend) configurePeriodicTidyInterval(v string) {
+	if v == "" {
+		return
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		b.Logger().Warn("ignoring invalid VAULT_APPROLE_TIDY_INTERVAL", "value", v)
+		return
+	}
+	b.periodicTidyInterval = d
+	b.Logger().Info("periodic secret ID tidy interval set", "interval", d)
 }
 
 func Backend(conf *logical.BackendConfig) (*backend, error) {
@@ -165,13 +194,27 @@ func (b *backend) invalidate(_ context.Context, key string) {
 // RoleRole backend utilizes this function to delete expired SecretID entries.
 // This could mean that the SecretID may live in the backend upto 1 min after its
 // expiration. The deletion of SecretIDs are not security sensitive and it is okay
-// to delay the removal of SecretIDs by a minute.
+// to delay the removal of SecretIDs by a minute. VAULT_APPROLE_TIDY_INTERVAL
+// can lengthen that delay to reduce storage list operations.
 func (b *backend) periodicFunc(ctx context.Context, req *logical.Request) error {
 	// Initiate clean-up of expired SecretID entries
-	if !b.System().ReplicationState().HasState(consts.ReplicationPerformanceStandby) {
+	if !b.System().ReplicationState().HasState(consts.ReplicationPerformanceStandby) && b.periodicTidyDue(time.Now()) {
 		b.tidySecretID(ctx, req)
 	}
 	return nil
+}
+
+// periodicTidyDue reports whether a periodic tidy should be attempted at now,
+// recording the attempt when it should. The first call always runs.
+func (b *backend) periodicTidyDue(now time.Time) bool {
+	if b.periodicTidyInterval <= 0 {
+		return true
+	}
+	last := b.lastPeriodicTidy.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < b.periodicTidyInterval {
+		return false
+	}
+	return b.lastPeriodicTidy.CompareAndSwap(last, now.UnixNano())
 }
 
 const backendHelp = `

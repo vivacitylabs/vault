@@ -6,6 +6,7 @@ package approle
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,7 +14,72 @@ import (
 
 	"github.com/hashicorp/vault/sdk/helper/testhelpers/schema"
 	"github.com/hashicorp/vault/sdk/logical"
+	"github.com/stretchr/testify/require"
 )
+
+func TestAppRole_PeriodicTidyDue(t *testing.T) {
+	b, _ := createBackendWithStorage(t)
+	now := time.Now()
+
+	// Without an interval every invocation tidies, as upstream
+	require.True(t, b.periodicTidyDue(now))
+	require.True(t, b.periodicTidyDue(now))
+
+	b.periodicTidyInterval = 3 * time.Hour
+	require.True(t, b.periodicTidyDue(now), "first run after start should tidy")
+	require.False(t, b.periodicTidyDue(now.Add(time.Minute)))
+	require.False(t, b.periodicTidyDue(now.Add(3*time.Hour-time.Second)))
+	require.True(t, b.periodicTidyDue(now.Add(3*time.Hour)))
+	require.False(t, b.periodicTidyDue(now.Add(3*time.Hour+time.Minute)))
+}
+
+func TestAppRole_ConfigurePeriodicTidyInterval(t *testing.T) {
+	for _, tc := range []struct {
+		value string
+		want  time.Duration
+	}{
+		{"", 0},
+		{"3h", 3 * time.Hour},
+		{"90m", 90 * time.Minute},
+		{"bogus", 0},
+		{"-1h", 0},
+		{"0s", 0},
+	} {
+		b, _ := createBackendWithStorage(t)
+		b.configurePeriodicTidyInterval(tc.value)
+		require.Equal(t, tc.want, b.periodicTidyInterval, "value %q", tc.value)
+	}
+}
+
+func TestAppRole_PeriodicFuncRespectsTidyInterval(t *testing.T) {
+	b, storage := createBackendWithStorage(t)
+	createRole(t, b, storage, "role1", "a,b,c")
+
+	entry, err := logical.StorageEntryJSON("accessor/dangling", &secretIDAccessorStorageEntry{
+		SecretIDHMAC: "samplesecretidhmac",
+	})
+	require.NoError(t, err)
+	require.NoError(t, storage.Put(context.Background(), entry))
+	req := &logical.Request{Storage: storage}
+
+	// A tidy ran recently, so the periodic call must not start another
+	b.periodicTidyInterval = time.Hour
+	b.lastPeriodicTidy.Store(time.Now().UnixNano())
+	require.NoError(t, b.periodicFunc(context.Background(), req))
+	require.Zero(t, atomic.LoadUint32(b.tidySecretIDCASGuard), "tidy should not have started")
+	accessors, err := storage.List(context.Background(), "accessor/")
+	require.NoError(t, err)
+	require.Contains(t, accessors, "dangling")
+
+	// Once the interval has passed, the periodic call tidies the dangling accessor
+	b.lastPeriodicTidy.Store(time.Now().Add(-2 * time.Hour).UnixNano())
+	require.NoError(t, b.periodicFunc(context.Background(), req))
+	require.Eventually(t, func() bool {
+		accessors, err := storage.List(context.Background(), "accessor/")
+		return err == nil && !slices.Contains(accessors, "dangling") &&
+			atomic.LoadUint32(b.tidySecretIDCASGuard) == 0
+	}, 10*time.Second, 100*time.Millisecond)
+}
 
 func TestAppRole_TidyDanglingAccessors_Normal(t *testing.T) {
 	b, storage := createBackendWithStorage(t)
