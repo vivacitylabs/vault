@@ -6,6 +6,7 @@ package vault
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -61,6 +62,13 @@ func (c *Core) setupConsumptionBilling(ctx context.Context) error {
 }
 
 func (c *Core) consumptionBillingMetricsWorker(ctx context.Context) {
+	// Keep billing state initialized, but allow operators to avoid the periodic
+	// KV walks and other scheduled billing collection on object storage.
+	if os.Getenv("VAULT_DISABLE_CONSUMPTION_BILLING") == "true" {
+		c.logger.Info("periodic consumption billing metrics disabled")
+		return
+	}
+
 	go func() {
 		c.consumptionBillingLock.RLock()
 		// Check if the clock has been overridden for testing purposes
